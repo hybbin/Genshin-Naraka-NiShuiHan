@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 # coding=utf-8
+
 import mido
 import ctypes
 import win32api
 import time
 import json
 import os
-import ctypes
+import threading
+import concurrent.futures
 import sys
 from PyQt5.QtCore import QThread, pyqtSignal
 
@@ -22,6 +24,11 @@ note = [12, 14, 16, 17, 19, 21, 23,
         24, 26, 28, 29, 31, 33, 35,
         36, 38, 40, 41, 43, 45, 47]
 
+pressed_key = set()
+
+note_map, configure = None, {}
+
+# ... （之前的代码）
 pressed_key = set()
 
 note_map, configure = None, {}
@@ -94,6 +101,16 @@ configure_attr = {
 }
 
 
+
+
+
+# 新增一个锁，用于控制对pressed_key集合的访问
+pressed_key_lock = threading.Lock()
+
+# 创建一个线程池
+thread_pool = concurrent.futures.ThreadPoolExecutor()
+
+# ... （之前的代码）
 def read_configure():
     global configure
     if os.path.exists("configure.json"):
@@ -249,7 +266,8 @@ class Input(ctypes.Structure):
                 ("ii", Input_I)]
 
 
-# 构建演奏子线程，用于后台开始自动演奏
+
+
 class PlayThread(QThread):
     playSignal = pyqtSignal(str)
     file_path = None
@@ -257,36 +275,64 @@ class PlayThread(QThread):
     def __init__(self, parent=None):
         super(PlayThread, self).__init__(parent)
         self.playFlag = False
+        self.key_press_times = {}  # 用于跟踪按键的按下时间
         read_configure()
-        pass
 
-    # 设置停止标志位，安全退出线程
+    # ... （之前的代码）
     def stop_play(self):
         self.playFlag = False
-        pass
 
-    # 设置演奏的midi文件位置
     def set_file_path(self, file_path):
         self.file_path = file_path
-        pass
 
-    # 子线程工作内容，改编自main()函数
+    def press_key(self, hex_key_code):
+        global pressed_key
+        pressed_key.add(hex_key_code)
+        extra = ctypes.c_ulong(0)
+        ii_ = Input_I()
+        ii_.ki = KeyBdInput(0, hex_key_code, 0x0008, 0, ctypes.pointer(extra))
+        x = Input(ctypes.c_ulong(1), ii_)
+        ctypes.windll.user32.SendInput(1, ctypes.pointer(x), ctypes.sizeof(x))
+        
+        # 记录按键的按下时间
+        self.key_press_times[hex_key_code] = time.time()
+
+    def release_key(self, hex_key_code):
+        global pressed_key
+        pressed_key.discard(hex_key_code)
+        extra = ctypes.c_ulong(0)
+        ii_ = Input_I()
+        ii_.ki = KeyBdInput(0, hex_key_code, 0x0008 | 0x0002, 0, ctypes.pointer(extra))
+        x = Input(ctypes.c_ulong(1), ii_)
+        ctypes.windll.user32.SendInput(1, ctypes.pointer(x), ctypes.sizeof(x))
+        
+        # 计算按键按下的时长并等待相应的时间
+        if hex_key_code in self.key_press_times:
+            press_time = self.key_press_times[hex_key_code]
+            release_time = time.time()
+            duration = release_time - press_time
+            if duration > 0:
+                time.sleep(duration)
+
     def run(self):
         self.playFlag = True
         global note_map
         midi = mido.MidiFile(self.file_path)
         print_split_line()
         tracks = midi.tracks
-        base_note = get_base_note(tracks) if configure["lowest_pitch_name"] == -1 else configure[
-            "lowest_pitch_name"]
+        base_note = get_base_note(tracks) if configure["lowest_pitch_name"] == -1 else configure["lowest_pitch_name"]
         note_map = {note[i] + base_note * 12: key[i] for i in range(len(note))}
-        time.sleep(1)
+        current_time = time.time()
+        note_start_time = {}
+
         for msg in midi.play():
             if not self.playFlag:
                 self.playSignal.emit('停止演奏！')
                 print('停止演奏！')
                 break
-            if msg.type == "note_on" or msg.type == "note_off":
+            if msg.type == "note_on":
+                current_time += msg.time
+                note_start_time[msg.note] = current_time
                 note_list = get_note(msg.note)
                 for n in note_list:
                     if not self.playFlag:
@@ -294,28 +340,47 @@ class PlayThread(QThread):
                         print('停止演奏！！')
                         break
                     if n in note_map:
-                        if msg.type == "note_on":
-                            if vk[note_map[n]] in pressed_key:
-                                release_key(vk[note_map[n]])
-                            press_key(vk[note_map[n]])
-                        elif msg.type == "note_off":
-                            release_key(vk[note_map[n]])
+                        # 使用线程池启动一个新线程来播放音符
+                        thread_pool.submit(self.play_note, vk[note_map[n]])
+
+            elif msg.type == "note_off":
+                # ... （之前的代码）
+                if msg.note in note_start_time:
+                    duration = current_time - note_start_time[msg.note]
+                    if duration > 0:
+                        self.release_key(vk[note_map[msg.note]])
+                        del note_start_time[msg.note]
         pass
 
+    # 新的方法用于播放音符
+    def play_note(self, hex_key_code):
+        with pressed_key_lock:
+            pressed_key.add(hex_key_code)
+        extra = ctypes.c_ulong(0)
+        ii_ = Input_I()
+        ii_.ki = KeyBdInput(0, hex_key_code, 0x0008, 0, ctypes.pointer(extra))
+        x = Input(ctypes.c_ulong(1), ii_)
+        ctypes.windll.user32.SendInput(1, ctypes.pointer(x), ctypes.sizeof(x))
 
+        # 等待一段时间，然后释放按键
+        time.sleep(0.1)  # 调整这个时间以控制每个音符的播放时长
+        with pressed_key_lock:
+            pressed_key.discard(hex_key_code)
+        extra = ctypes.c_ulong(0)
+        ii_ = Input_I()
+        ii_.ki = KeyBdInput(0, hex_key_code, 0x0008 | 0x0002, 0, ctypes.pointer(extra))
+        x = Input(ctypes.c_ulong(1), ii_)
+        ctypes.windll.user32.SendInput(1, ctypes.pointer(x), ctypes.sizeof(x))
+
+# ... （之后的代码）
 def press_key(hex_key_code):
-    global pressed_key
-    pressed_key.add(hex_key_code)
     extra = ctypes.c_ulong(0)
     ii_ = Input_I()
     ii_.ki = KeyBdInput(0, hex_key_code, 0x0008, 0, ctypes.pointer(extra))
     x = Input(ctypes.c_ulong(1), ii_)
     ctypes.windll.user32.SendInput(1, ctypes.pointer(x), ctypes.sizeof(x))
 
-
 def release_key(hex_key_code):
-    global pressed_key
-    pressed_key.discard(hex_key_code)
     extra = ctypes.c_ulong(0)
     ii_ = Input_I()
     ii_.ki = KeyBdInput(0, hex_key_code, 0x0008 | 0x0002, 0, ctypes.pointer(extra))
@@ -328,7 +393,6 @@ def is_admin():
         return ctypes.windll.shell32.IsUserAnAdmin()
     except RuntimeError:
         return False
-
 
 def main():
     global note_map
@@ -348,18 +412,31 @@ def main():
             base_note = get_base_note(tracks) if configure["lowest_pitch_name"] == -1 else configure[
                 "lowest_pitch_name"]
             note_map = {note[i] + base_note * 12: key[i] for i in range(len(note))}
-            time.sleep(1)
+            current_time = time.time()  # 初始化当前时间戳
+            note_start_time = {}  # 用于记录音符的开始时间
             for msg in midi.play():
                 if msg.type == "note_on" or msg.type == "note_off":
                     note_list = get_note(msg.note)
                     for n in note_list:
                         if n in note_map:
+                            # 计算时间差并添加到当前时间戳
+                            current_time += msg.time
                             if msg.type == "note_on":
                                 if vk[note_map[n]] in pressed_key:
-                                    release_key(vk[note_map[n]])
-                                press_key(vk[note_map[n]])
+                                    play_note(vk[note_map[n]])  # 播放音符
+                                else:
+                                    press_key(vk[note_map[n]])  # 按下键
+                                # 记录音符的开始时间
+                                note_start_time[msg.note] = current_time
                             elif msg.type == "note_off":
-                                release_key(vk[note_map[n]])
+                                # 计算音符的持续时间
+                                if msg.note in note_start_time:
+                                    duration = current_time - note_start_time[msg.note]
+                                    #if duration > 0:
+                                        # 等待音符的持续时间
+                                        #time.sleep(duration)
+                                    release_key(vk[note_map[n]])  # 释放键
+                                    del note_start_time[msg.note]
         except Exception as e:
             print("ERR:" + str(e))
 
